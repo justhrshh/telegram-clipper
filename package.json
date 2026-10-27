@@ -1,0 +1,27 @@
+{
+  "name": "telegram-clipper",
+  "version": "1.0.0",
+  "description": "Telegram bot foundation for creating podcast-ready vertical video clips from YouTube",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:local": "powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1",
+    "dev": "node --watch --watch-path=src src/index.js",
+    "diagnose": "node scripts/diagnose.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "telegraf",
+    "video-clipper",
+    "youtube"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "pg": "^8.23.0",
+    "telegraf": "^4.16.3"
+  }
+}

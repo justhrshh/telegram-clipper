@@ -1,0 +1,24 @@
+node_modules/
+.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+temp/
+.venv/
+__pycache__/
+*.pyc
+
+# Authentication & Credentials (Never commit)
+*cookies*.txt
+*.cookies
+cookies/
+secrets/
+*~*
+*.binlog
+
+# Scratch and Large Binaries
+scratch/
+tools/telegram-bot-api/
+assets/hf_cache/
+
