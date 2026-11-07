@@ -1,6 +1,7 @@
-import { spawn, exec } from 'node:child_process';
+import { spawn, exec, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import nodeFs from 'node:fs';
 import { logger } from '../utils/logger.js';
 import { PipelineStage, PipelineError, sanitizeUrl, sanitizeArgs } from '../utils/errors.js';
 import { parseTimestampToSeconds } from '../utils/validator.js';
@@ -10,6 +11,46 @@ import { probeMedia } from './videoProcessor.js';
 import { traceAudioStage } from './video/audioPreservation.js';
 import { getYtDlpAuthArgs, getYtDlpAuthDiagnostics, sanitizeYtDlpArgs } from './youtube/youtubeAuth.js';
 import { classifyDownloadError, isRecoverableViaFullDownload, DownloadErrorType } from './youtube/youtubeErrorClassifier.js';
+
+let cachedPythonTarget = null;
+
+/**
+ * Dynamically resolves the best Python / yt-dlp executable on the host system.
+ * Works on Windows, Linux, Docker, and Render environments.
+ *
+ * @returns {{ executable: string, baseArgs: string[] }}
+ */
+export function resolvePythonTarget() {
+  if (cachedPythonTarget) return cachedPythonTarget;
+
+  const candidates = [];
+  if (process.env.PYTHON_PATH) candidates.push(process.env.PYTHON_PATH);
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || '';
+    for (const ver of ['Python313', 'Python312', 'Python311', 'Python310']) {
+      const p = path.join(localAppData, 'Programs', 'Python', ver, 'python.exe');
+      if (nodeFs.existsSync(p)) candidates.push(p);
+    }
+    const programFiles = process.env.ProgramFiles || '';
+    for (const ver of ['Python313', 'Python312', 'Python311', 'Python310']) {
+      const p = path.join(programFiles, ver, 'python.exe');
+      if (nodeFs.existsSync(p)) candidates.push(p);
+    }
+  }
+  candidates.push('python3', 'python', 'py');
+
+  for (const c of candidates) {
+    try {
+      execFileSync(c, ['-m', 'yt_dlp', '--version'], { stdio: 'ignore', windowsHide: true });
+      cachedPythonTarget = { executable: c, baseArgs: ['-m', 'yt_dlp'] };
+      logger.info(`[YOUTUBE_DOWNLOADER] Resolved Python target for yt-dlp: ${c}`);
+      return cachedPythonTarget;
+    } catch {}
+  }
+
+  cachedPythonTarget = { executable: 'py', baseArgs: ['-m', 'yt_dlp'] };
+  return cachedPythonTarget;
+}
 
 /**
  * Configurable timeouts from environment variables with safe defaults.
@@ -195,17 +236,18 @@ export async function inspectAndSelectFormats({ url, jobId, targetMaxHeight = 21
   const formatSort = 'res,fps,codec:h264,proto';
   const standardSelector = buildMediaFormatSelector({ targetMaxHeight });
 
-  async function fetchFormatJson(useMobileFallback = false) {
+  async function fetchFormatJson({ useMobileFallback = false, skipAuth = false } = {}) {
     const clients = useMobileFallback
       ? 'youtube:player_client=web_embedded,mweb,ios,android,tv'
-      : 'youtube:player_client=default,web_embedded,ios,android,mweb,tv';
-    const authArgs = getYtDlpAuthArgs();
+      : 'youtube:player_client=default,tv_embedded,web_embedded';
+    const authArgs = skipAuth ? [] : getYtDlpAuthArgs();
+    const { executable, baseArgs } = resolvePythonTarget();
 
     return new Promise((resolve, reject) => {
       const child = spawn(
-        'py',
+        executable,
         [
-          '-m', 'yt_dlp',
+          ...baseArgs,
           '-4',
           ...authArgs,
           '-J',
@@ -236,20 +278,52 @@ export async function inspectAndSelectFormats({ url, jobId, targetMaxHeight = 21
 
   try {
     let stdout;
+    const authActive = getYtDlpAuthArgs().length > 0;
     try {
-      stdout = await fetchFormatJson(false);
+      stdout = await fetchFormatJson({ useMobileFallback: false, skipAuth: false });
     } catch (primaryErr) {
       const classified = classifyDownloadError(primaryErr.message, '', primaryErr);
-      if (
+      const isBotOrRateLimit =
         classified.type === DownloadErrorType.BOT_VERIFICATION_REQUIRED ||
         classified.type === DownloadErrorType.NETWORK_ERROR ||
-        primaryErr.message.includes('429')
-      ) {
-        logger.warn(
-          `[${jobId}] [BOT_CHALLENGE_AUTO_FALLBACK] Web client encountered challenge/429. Retrying with mobile player clients (ios, android, tv)...`
-        );
-        stdout = await fetchFormatJson(true);
-        logger.info(`[${jobId}] [BOT_CHALLENGE_RESOLVED] Successfully resolved formats via mobile client fallback.`);
+        primaryErr.message.includes('429');
+
+      if (isBotOrRateLimit) {
+        let fallbackSucceeded = false;
+
+        // Fallback 1: If cookies were passed and caused bot verification, retry unauthenticated!
+        if (authActive) {
+          logger.warn(
+            `[${jobId}] [BOT_CHALLENGE_AUTO_FALLBACK] Web client encountered challenge with cookies. Retrying unauthenticated with modern player clients...`
+          );
+          try {
+            stdout = await fetchFormatJson({ useMobileFallback: false, skipAuth: true });
+            logger.info(`[${jobId}] [BOT_CHALLENGE_RESOLVED] Successfully resolved formats unauthenticated.`);
+            fallbackSucceeded = true;
+          } catch (unauthErr) {
+            logger.warn(`[${jobId}] Unauthenticated primary fallback also encountered: ${unauthErr.message}`);
+          }
+        }
+
+        // Fallback 2: Mobile player clients (ios, android, tv)
+        if (!fallbackSucceeded) {
+          logger.warn(
+            `[${jobId}] [BOT_CHALLENGE_AUTO_FALLBACK] Retrying format inspection with mobile player clients (ios, android, tv)...`
+          );
+          try {
+            stdout = await fetchFormatJson({ useMobileFallback: true, skipAuth: true });
+            logger.info(`[${jobId}] [BOT_CHALLENGE_RESOLVED] Successfully resolved formats via unauthenticated mobile fallback.`);
+            fallbackSucceeded = true;
+          } catch (mobileErr) {
+            if (authActive) {
+              stdout = await fetchFormatJson({ useMobileFallback: true, skipAuth: false });
+              logger.info(`[${jobId}] [BOT_CHALLENGE_RESOLVED] Successfully resolved formats via mobile client fallback with auth.`);
+              fallbackSucceeded = true;
+            } else {
+              throw mobileErr;
+            }
+          }
+        }
       } else {
         throw primaryErr;
       }
@@ -382,21 +456,21 @@ async function executeYtDlpDownload({
   formatSelector = null,
   formatDecision = null,
   forceMobile = false,
+  skipAuth = false,
 }) {
   const sanitizedUrl = sanitizeUrl(url);
   const tempRootDir = path.dirname(effectiveJobDir);
-  const executable = 'py';
-  const authArgs = getYtDlpAuthArgs();
-  const authDiagnostics = getYtDlpAuthDiagnostics();
+  const { executable, baseArgs } = resolvePythonTarget();
+  const authArgs = skipAuth ? [] : getYtDlpAuthArgs();
+  const authDiagnostics = skipAuth ? { description: 'Bypassed (fallback unauthenticated)' } : getYtDlpAuthDiagnostics();
   const nodeRuntimeSpec = process.execPath ? `node:${process.execPath}` : 'node';
   const playerClients = forceMobile
     ? 'youtube:player_client=web_embedded,mweb,ios,android,tv'
-    : 'youtube:player_client=default,web_embedded,ios,android,mweb,tv';
+    : 'youtube:player_client=default,tv_embedded,web_embedded';
 
   // Build argument array
   const args = [
-    '-m',
-    'yt_dlp',
+    ...baseArgs,
     '-4',
     ...authArgs,
     // Supply Node.js as the JavaScript runtime to resolve YouTube bot/n-sig challenges
@@ -949,10 +1023,53 @@ export async function downloadYouTubeVideo({
         sectionError
       );
 
-      // Automatic fallback 1: Bot verification challenges or 429 rate limit - retry section download with mobile player clients
+      // Automatic fallback 1: Bot verification challenges or 429 rate limit - multi-tier recovery
       if (classified.type === DownloadErrorType.BOT_VERIFICATION_REQUIRED || sectionError.stderr?.includes('429')) {
+        const authActive = getYtDlpAuthArgs().length > 0;
+
+        // Tier 1a: If cookies caused bot challenge, retry unauthenticated with modern desktop/visionos player clients
+        if (authActive) {
+          logger.warn(
+            `[${jobId}] [BOT_CHALLENGE_DOWNLOAD_RETRY] Web client download blocked by anti-bot verification with cookies. Retrying section download unauthenticated...`
+          );
+          try {
+            const unauthResult = await executeYtDlpDownload({
+              url,
+              effectiveJobDir,
+              outputTemplate,
+              sectionRange,
+              jobId,
+              stallTimeoutMs,
+              maxDurationMs,
+              requestedDuration: sectionDuration,
+              formatSelector: '(bestvideo[height<=1080]/best)+(bestaudio)/best',
+              formatDecision,
+              forceMobile: false,
+              skipAuth: true,
+            });
+
+            const downloadedDuration = Number(unauthResult.metadata?.duration || 0);
+            const isRangePass = downloadedDuration > 0 && downloadedDuration <= Math.max(sectionDuration * 2.5, sectionDuration + 10);
+
+            logger.info(`[${jobId}] [BOT_CHALLENGE_RETRY_SUCCESS] Unauthenticated section download succeeded without bot challenge!`);
+
+            return {
+              sourcePath: unauthResult.sourcePath,
+              filename: unauthResult.filename,
+              isSourceTrimmed: true,
+              metadata: unauthResult.metadata,
+              downloadMetrics: unauthResult.downloadMetrics,
+              formatDecision: unauthResult.formatDecision || formatDecision,
+              rangeStatus: isRangePass ? 'PASS' : 'FAIL',
+            };
+          } catch (unauthErr) {
+            logger.warn(`[${jobId}] Unauthenticated section download retry also encountered challenge: ${unauthErr.message}`);
+          }
+        }
+
+        // Tier 1b: Retry section download with mobile player clients (ios, android, tv) without cookies
         logger.warn(
-          `[${jobId}] [BOT_CHALLENGE_DOWNLOAD_RETRY] Web client download blocked by anti-bot verification. Automatically retrying section download with mobile player clients (ios, android, tv)...`
+          `[${jobId}] [BOT_CHALLENGE_DOWNLOAD_RETRY] Retrying section download with mobile player clients (ios, android, tv)...`
         );
         try {
           const mobileResult = await executeYtDlpDownload({
@@ -967,6 +1084,7 @@ export async function downloadYouTubeVideo({
             formatSelector: 'bestvideo[height<=1080]+bestaudio/best',
             formatDecision,
             forceMobile: true,
+            skipAuth: true,
           });
 
           const downloadedDuration = Number(mobileResult.metadata?.duration || 0);
